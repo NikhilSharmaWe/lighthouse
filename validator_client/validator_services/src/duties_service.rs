@@ -399,6 +399,7 @@ impl<S, T> DutiesServiceBuilder<S, T> {
                 .validator_store
                 .ok_or("Cannot build DutiesService without validator_store")?,
             unknown_validator_next_poll_slots: Default::default(),
+            proposer_duties_local_pubkeys: Default::default(),
             slot_clock: self
                 .slot_clock
                 .ok_or("Cannot build DutiesService without slot_clock")?,
@@ -432,6 +433,9 @@ pub struct DutiesService<S, T> {
     pub validator_store: Arc<S>,
     /// Maps unknown validator pubkeys to the next slot time when a poll should be conducted again.
     pub unknown_validator_next_poll_slots: RwLock<HashMap<PublicKeyBytes, Slot>>,
+    /// Local voting pubkeys present when proposer duties were last successfully downloaded.
+    /// Used to refetch mid-epoch when validators are added or removed.
+    proposer_duties_local_pubkeys: RwLock<HashSet<PublicKeyBytes>>,
     /// Tracks the current slot.
     pub slot_clock: T,
     /// Provides HTTP access to remote beacon nodes.
@@ -1617,9 +1621,10 @@ async fn fill_in_selection_proofs<S: ValidatorStore + 'static, T: SlotClock + 's
 ///
 /// This function is invoked once per slot. Block production notifications are sent on every
 /// invocation using the local cache. Beacon node HTTP requests are skipped unless duties are
-/// missing from the cache or it is the first slot of an epoch (to refresh the `dependent_root`).
-/// After the Fulu fork, duties for the next epoch are also fetched at epoch boundaries so that
-/// block production for the first slot of an epoch can use cached duties.
+/// missing from the cache, the local validator set has changed, or it is the first slot of an
+/// epoch (to refresh the `dependent_root`). After the Fulu fork, duties for the next epoch are
+/// also fetched under the same conditions so that block production for the first slot of an epoch
+/// can use cached duties.
 ///
 /// ## Note
 ///
@@ -1681,25 +1686,42 @@ async fn poll_beacon_proposers<S: ValidatorStore, T: SlotClock + 'static>(
             .fulu_fork_epoch
             .is_some_and(|fork_epoch| current_epoch >= fork_epoch);
 
+        let local_pubkeys_changed = {
+            let fetched_pubkeys = duties_service.proposer_duties_local_pubkeys.read();
+            *fetched_pubkeys != local_pubkeys
+        };
+
         let (need_current_epoch, need_next_epoch) = {
             let proposers = duties_service.proposers.read();
-            let need_current_epoch =
-                is_first_slot_of_epoch || !proposers.contains_key(&current_epoch);
-            let need_next_epoch =
-                fulu_active && (is_first_slot_of_epoch || !proposers.contains_key(&next_epoch));
-            (need_current_epoch, need_next_epoch)
+            should_fetch_proposer_duties(
+                is_first_slot_of_epoch,
+                proposers.contains_key(&current_epoch),
+                proposers.contains_key(&next_epoch),
+                fulu_active,
+                local_pubkeys_changed,
+            )
         };
 
         let mut duties_updated = false;
+        let mut required_fetches_succeeded = true;
         if need_current_epoch {
-            duties_updated |=
+            let ok =
                 fetch_and_store_proposer_duties(duties_service, current_epoch, &local_pubkeys)
                     .await;
+            duties_updated |= ok;
+            required_fetches_succeeded &= ok;
         }
         if need_next_epoch {
-            duties_updated |=
-                fetch_and_store_proposer_duties(duties_service, next_epoch, &local_pubkeys)
-                    .await;
+            let ok =
+                fetch_and_store_proposer_duties(duties_service, next_epoch, &local_pubkeys).await;
+            duties_updated |= ok;
+            required_fetches_succeeded &= ok;
+        }
+
+        // Only record the local set once every required download for this poll succeeded, so a
+        // partial failure retries on the next slot.
+        if required_fetches_succeeded && (need_current_epoch || need_next_epoch) {
+            *duties_service.proposer_duties_local_pubkeys.write() = local_pubkeys.clone();
         }
 
         if duties_updated {
@@ -1742,6 +1764,22 @@ async fn poll_beacon_proposers<S: ValidatorStore, T: SlotClock + 'static>(
         .retain(|&epoch, _| epoch + HISTORICAL_DUTIES_EPOCHS >= current_epoch);
 
     Ok(())
+}
+
+/// Decide whether to download proposer duties for the current and/or next epoch.
+///
+/// Returns `(need_current_epoch, need_next_epoch)`.
+fn should_fetch_proposer_duties(
+    is_first_slot_of_epoch: bool,
+    has_current_epoch: bool,
+    has_next_epoch: bool,
+    fulu_active: bool,
+    local_pubkeys_changed: bool,
+) -> (bool, bool) {
+    let need_refresh = is_first_slot_of_epoch || local_pubkeys_changed;
+    let need_current_epoch = need_refresh || !has_current_epoch;
+    let need_next_epoch = fulu_active && (need_refresh || !has_next_epoch);
+    (need_current_epoch, need_next_epoch)
 }
 
 /// Download proposer duties for `epoch` from the beacon node and store them in
@@ -2133,5 +2171,56 @@ mod test {
         let subscription_slots = SubscriptionSlots::new(duty_slot + 1, current_slot);
         assert_eq!(subscription_slots.slots.len(), 1);
         assert!(subscription_slots.should_send_subscription_at(current_slot + 1),);
+    }
+
+    #[test]
+    fn proposer_duties_fetch_gating() {
+        // Warm cache, mid-epoch, pre-Fulu: skip all HTTP.
+        assert_eq!(
+            should_fetch_proposer_duties(false, true, false, false, false),
+            (false, false)
+        );
+
+        // Warm cache, mid-epoch, post-Fulu with next epoch cached: skip all HTTP.
+        assert_eq!(
+            should_fetch_proposer_duties(false, true, true, true, false),
+            (false, false)
+        );
+
+        // Epoch boundary refreshes current always, and next when Fulu is active.
+        assert_eq!(
+            should_fetch_proposer_duties(true, true, true, false, false),
+            (true, false)
+        );
+        assert_eq!(
+            should_fetch_proposer_duties(true, true, true, true, false),
+            (true, true)
+        );
+
+        // Cache miss mid-epoch.
+        assert_eq!(
+            should_fetch_proposer_duties(false, false, false, false, false),
+            (true, false)
+        );
+        assert_eq!(
+            should_fetch_proposer_duties(false, false, false, true, false),
+            (true, true)
+        );
+
+        // Next-epoch cache miss only (post-Fulu).
+        assert_eq!(
+            should_fetch_proposer_duties(false, true, false, true, false),
+            (false, true)
+        );
+
+        // Local validator set changed mid-epoch.
+        assert_eq!(
+            should_fetch_proposer_duties(false, true, true, false, true),
+            (true, false)
+        );
+        assert_eq!(
+            should_fetch_proposer_duties(false, true, true, true, true),
+            (true, true)
+        );
     }
 }
