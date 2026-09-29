@@ -27,3 +27,7 @@ fixed_bytes = { workspace = true }
 [[bench]]
 name = "find_head"
 harness = false
+
+[[bench]]
+name = "is_payload_invalid"
+harness = false
